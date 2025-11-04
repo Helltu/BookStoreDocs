@@ -207,7 +207,280 @@ Backend API также является точкой интеграции с в�
 
 ### Безопасность
 
-Описать подходы, использованные для обеспечения безопасности, включая описание процессов аутентификации и авторизации с примерами кода из репозитория сервера
+## Реализация системы аутентификации и авторизации
+
+В ходе реализации системы аутентификации и авторизации был использован ряд ключевых компонентов и сторонних библиотек, которые в совокупности образуют надёжный и современный механизм безопасности.
+
+Основой для всей системы послужил **фреймворк Spring Security**, который является стандартом для защиты приложений в экосистеме Spring. Он предоставляет гибкую архитектуру, основанную на цепочке фильтров, позволяя детально настраивать правила доступа и процессы аутентификации.
+
+Конфигурация этой основы была разделена на два логических класса:
+
+* `ApplicationConfig` — определяет вспомогательные компоненты.
+* `SecurityConfig` — отвечает за настройку правил безопасности.
+
+---
+
+### Класс ApplicationConfig
+
+```java
+@Configuration
+@RequiredArgsConstructor
+public class ApplicationConfig {
+    private final UserRepository userRepository;
+
+    @Bean
+    public UserDetailsService userDetailsService() {
+        return username -> userRepository.findByUsername(username)
+                .orElseThrow(() -> new UsernameNotFoundException("User not found with username: " + username));
+    }
+
+    @Bean
+    public AuthenticationManager authenticationManager(AuthenticationConfiguration config) throws Exception {
+        return config.getAuthenticationManager();
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+}
+```
+
+Класс **ApplicationConfig** является центральным конфигурационным центром, который предоставляет Spring Security основные компоненты (бины), необходимые для процесса аутентификации.
+
+Он отделяет определение этих «строительных блоков» от самих правил безопасности, что делает архитектуру более чистой и модульной.
+
+#### Ключевые бины:
+
+1. **UserDetailsService** — мост между Spring Security и базой данных пользователей. Ищет пользователя по имени и выбрасывает `UsernameNotFoundException`, если пользователь не найден.
+2. **PasswordEncoder** — использует `BCryptPasswordEncoder` для безопасного хеширования паролей.
+3. **AuthenticationManager** — оркестратор процесса аутентификации, использующий `UserDetailsService` и `PasswordEncoder`.
+
+---
+
+### Класс SecurityConfig
+
+```java
+@Configuration
+@EnableWebSecurity
+@RequiredArgsConstructor
+@EnableMethodSecurity
+public class SecurityConfig {
+
+    private final JwtAuthenticationFilter jwtAuthFilter;
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http.csrf(AbstractHttpConfigurer::disable)
+                .authorizeHttpRequests(req -> req
+                        .requestMatchers("/api/auth/**").permitAll()
+                        .anyRequest().authenticated()
+                )
+                .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}
+```
+
+Класс **SecurityConfig** является ядром системы безопасности приложения.
+Он определяет, **кто и к каким ресурсам имеет доступ**, а также **как обрабатываются запросы**.
+
+#### Ключевые аспекты конфигурации:
+
+1. **Отключение CSRF** — стандартная практика для API, использующих JWT.
+2. **Настройка правил авторизации**:
+
+    * `/api/auth/**` — публичная зона (регистрация и вход).
+    * Все остальные запросы требуют аутентификации.
+3. **Stateless-сессии** — сервер не хранит состояние пользователя между запросами.
+4. **Добавление JWT-фильтра** — интеграция кастомного фильтра `JwtAuthenticationFilter` для проверки токена.
+
+---
+
+### Класс JwtService
+
+Для работы с JWT была использована библиотека **io.jsonwebtoken:jjwt**, предоставляющая удобный API для генерации, парсинга и проверки токенов.
+
+```java
+@Service
+public class JwtService {
+
+    @Value("${application.security.jwt.secret-key}")
+    private String secretKey;
+
+    @Value("${application.security.jwt.expiration}")
+    private long jwtExpiration;
+
+    public String extractUsername(String token) {
+        return extractClaim(token, Claims::getSubject);
+    }
+
+    public <T> T extractClaim(String token, Function<Claims, T> claimsResolver) {
+        final Claims claims = extractAllClaims(token);
+        return claimsResolver.apply(claims);
+    }
+
+    public String generateToken(UserDetails userDetails) {
+        return generateToken(new HashMap<>(), userDetails);
+    }
+
+    public String generateToken(Map<String, Object> extraClaims, UserDetails userDetails) {
+        return Jwts.builder()
+                .setClaims(extraClaims)
+                .setSubject(userDetails.getUsername())
+                .setIssuedAt(new Date(System.currentTimeMillis()))
+                .setExpiration(new Date(System.currentTimeMillis() + jwtExpiration))
+                .signWith(getSignInKey(), SignatureAlgorithm.HS256)
+                .compact();
+    }
+
+    public boolean isTokenValid(String token, UserDetails userDetails) {
+        final String username = extractUsername(token);
+        return (username.equals(userDetails.getUsername())) && !isTokenExpired(token);
+    }
+
+    private boolean isTokenExpired(String token) {
+        return extractExpiration(token).before(new Date());
+    }
+
+    private Date extractExpiration(String token) {
+        return extractClaim(token, Claims::getExpiration);
+    }
+
+    private Claims extractAllClaims(String token) {
+        return Jwts.parserBuilder()
+                .setSigningKey(getSignInKey())
+                .build()
+                .parseClaimsJws(token)
+                .getBody();
+    }
+
+    private Key getSignInKey() {
+        byte[] keyBytes = Decoders.BASE64.decode(secretKey);
+        return Keys.hmacShaKeyFor(keyBytes);
+    }
+}
+```
+
+---
+
+### Класс JwtAuthenticationFilter
+
+**JwtAuthenticationFilter** — компонент, выполняющийся для каждого HTTP-запроса.
+Он извлекает токен из заголовка `Authorization`, проверяет его валидность и аутентифицирует пользователя.
+
+```java
+@Component
+@RequiredArgsConstructor
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    private final JwtService jwtService;
+    private final UserDetailsService userDetailsService;
+
+    @Override
+    protected void doFilterInternal(
+            @NonNull HttpServletRequest request,
+            @NonNull HttpServletResponse response,
+            @NonNull FilterChain filterChain
+    ) throws ServletException, IOException {
+
+        final String authHeader = request.getHeader("Authorization");
+
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        final String jwt = authHeader.substring(7);
+        final String username = jwtService.extractUsername(jwt);
+
+        if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+            UserDetails userDetails = this.userDetailsService.loadUserByUsername(username);
+
+            if (jwtService.isTokenValid(jwt, userDetails)) {
+                UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
+                        userDetails,
+                        null,
+                        userDetails.getAuthorities()
+                );
+                authToken.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+                SecurityContextHolder.getContext().setAuthentication(authToken);
+            }
+        }
+        filterChain.doFilter(request, response);
+    }
+}
+```
+
+---
+
+### Механизмы обеспечения безопасности
+
+#### 1. Шифрование паролей
+
+Пароли пользователей **не хранятся в открытом виде**.
+Используется **BCryptPasswordEncoder**, определённый в `ApplicationConfig`, который применяется при регистрации и проверке паролей.
+
+#### 2. Авторизация и роли
+
+В системе определены роли:
+
+* `CLIENT`
+* `MANAGER`
+
+Используется **методная безопасность** с аннотацией `@EnableMethodSecurity`.
+Для читаемости создана мета-аннотация:
+
+```java
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+@PreAuthorize("hasAuthority('MANAGER')")
+public @interface IsManager {
+}
+```
+
+#### 3. Защита от повышения привилегий
+
+Эндпоинт `/api/auth/register` создаёт **только клиентов (CLIENT)**.
+Создание менеджеров выполняется через защищённый механизм `DataInitializer`.
+
+---
+
+### Класс DataInitializer
+
+```java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class DataInitializer implements CommandLineRunner {
+
+    private final UserRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
+
+    @Value("${manager.password}")
+    private String managerPassword;
+
+    @Override
+    public void run(String... args) throws Exception {
+        if (userRepository.findByRole(Role.MANAGER).isEmpty()) {
+            log.info("No managers found. Creating a default manager account...");
+            User manager = User.builder()
+                    .username("manager")
+                    .email("manager@bookstore.com")
+                    .password(passwordEncoder.encode(managerPassword))
+                    .role(Role.MANAGER)
+                    .build();
+            userRepository.save(manager);
+            log.info("Default manager account created with username 'manager'");
+        }
+    }
+}
+```
+
+Этот класс автоматически создаёт **учётную запись менеджера по умолчанию** при первом запуске приложения, обеспечивая безопасную «точку входа» для администрирования системы.
+
 
 ### Оценка качества кода
 
