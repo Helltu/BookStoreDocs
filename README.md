@@ -50,7 +50,6 @@
     2. [Интеграционные тесты](#интеграционные-тесты)
 6. [Установка и запуск](#установка-и-запуск)
     1. [Манифесты для сборки docker образов](#манифесты-для-сборки-docker-образов)
-    2. [Манифесты для развертывания k8s кластера](#манифесты-для-развертывания-k8s-кластера)
 7. [Лицензия](#лицензия)
 8. [Контакты](#контакты)
 
@@ -599,11 +598,169 @@ public class DataInitializer implements CommandLineRunner {
 
 ### Манифесты для сборки docker образов
 
-Представить весь код манифестов или ссылки на файлы с ними (при необходимости снабдить комментариями)
+#### Развертывание программного средства
 
-### Манифесты для развертывания k8s кластера
+Процесс развертывания программного средства построен на современных DevOps-практиках с использованием контейнеризации Docker. Такой подход обеспечивает:
 
-Представить весь код манифестов или ссылки на файлы с ними (при необходимости снабдить комментариями)
+* полную изоляцию компонентов системы;
+* идентичность окружения на всех этапах — от разработки до промышленной эксплуатации;
+* автоматизацию запуска всей инфраструктуры.
+
+Развертывание осуществляется на выделенном виртуальном сервере (VPS) с использованием **Docker Compose**. В основе лежит принцип строгого разделения кода и конфигурации: Docker-образ приложения **не содержит секретов**, все чувствительные данные передаются через переменные окружения.
+
+##### Подготовка Docker-образа
+
+Сборка начинается локально у разработчика. После завершения разработки и тестирования создаётся основной артефакт — оптимизированный Docker-образ, содержащий:
+
+* скомпилированное приложение,
+* минимальную среду выполнения (JRE).
+
+Готовый образ публикуется в приватный Docker Hub-реестр для безопасного хранения и версионирования.
+
+##### Dockerfile
+
+```dockerfile
+FROM maven:3.9.6-eclipse-temurin-21 AS builder
+
+WORKDIR /app
+
+COPY pom.xml .
+RUN mvn dependency:go-offline
+
+COPY src ./src
+
+RUN mvn clean package -DskipTests
+
+
+FROM eclipse-temurin:21-jre-noble
+
+WORKDIR /app
+
+COPY --from=builder /app/target/*.jar app.jar
+
+EXPOSE 8080
+
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+##### Команды сборки и публикации
+
+```bash
+# Сборка образа с присвоением тега
+docker build -t <имя_пользователя_в_реестре>/book-store:latest .
+
+# Публикация образа в приватный репозиторий
+docker push <имя_пользователя_в_реестре>/book-store:latest
+```
+
+##### Развертывание на сервере
+
+На сервере используется файл `docker-compose.prod.yml`, определяющий три основных сервиса:
+
+* **Backend API (book-store-app)**
+* **MySQL**
+* **Elasticsearch**
+
+Конфигурация передаётся в контейнеры через переменные окружения, загружаемые из файла `.env` в той же директории.
+
+##### Файл `docker-compose.prod.yml`
+
+```yaml
+services:
+  book-store-app:
+    image: hellty/book-store:latest
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:mysql://mysql-db:3306/book_store?useSSL=false
+      - SPRING_DATASOURCE_USERNAME=${DB_USER}
+      - SPRING_DATASOURCE_PASSWORD=${DB_PASSWORD}
+      - SPRING_ELASTICSEARCH_URIS=http://elasticsearch:9200
+      - APPLICATION_SECURITY_JWT_SECRET-KEY=${JWT_SECRET}
+      - MANAGER_PASSWORD=${MANAGER_PASSWORD}
+    depends_on:
+      mysql-db:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_started
+
+  mysql-db:
+    image: mysql:8.0
+    restart: always
+    environment:
+      - MYSQL_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+      - MYSQL_DATABASE=book_store
+      - MYSQL_USER=${DB_USER}
+      - MYSQL_PASSWORD=${DB_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysql", "-u", "${DB_USER}", "-p${DB_PASSWORD}", "-e", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  elasticsearch:
+    image: elasticsearch:8.11.1
+    restart: always
+    ports:
+      - "127.0.0.1:9200:9200"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+
+volumes:
+  mysql-data:
+  elasticsearch-data:
+```
+
+##### Файл `.env`
+
+```env
+DB_ROOT_PASSWORD=your_db_root_password
+DB_USER=book_store_user
+DB_PASSWORD=your_db_user_password
+
+JWT_SECRET=your_super_secret_jwt_key
+MANAGER_PASSWORD=your_secure_manager_password
+```
+
+##### Первый запуск системы
+
+Команда автоматически:
+
+* скачает необходимые образы,
+* создаст сеть и тома,
+* запустит контейнеры в правильном порядке,
+* дождётся готовности MySQL благодаря healthcheck.
+
+```bash
+docker-compose -f docker-compose.prod.yml up -d
+```
+
+##### Обновление приложения
+
+Обновление проходит без простоя базы и Elasticsearch:
+
+```bash
+# Скачать последнюю версию образа приложения
+docker-compose -f docker-compose.prod.yml pull book-store-app
+
+# Перезапустить сервисы для применения обновления
+docker-compose -f docker-compose.prod.yml up -d
+```
+
+---
+
+##### Мониторинг и управление
+
+```bash
+# Проверить статус запущенных контейнеров
+docker-compose -f docker-compose.prod.yml ps
+```
 
 ---
 
