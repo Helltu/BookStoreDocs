@@ -601,13 +601,245 @@ public class DataInitializer implements CommandLineRunner {
 
 ## **Тестирование**
 
-### Unit-тесты
+Ниже приведён аккуратно оформленный **Markdown-вариант** вашего текста с сохранением структуры, форматирования и примеров кода.
+Вы можете скопировать его в отчёт, документацию или README.
 
-Представить код тестов для пяти методов и его пояснение
+---
 
-### Интеграционные тесты
+### Стратегия тестирования
 
-Представить код тестов и его пояснение
+В рамках обеспечения качества разработанного программного средства была реализована комплексная стратегия тестирования, базирующаяся на принципах «пирамиды тестирования». Данная стратегия включает два уровня проверки:
+
+1. **Модульное (Unit) тестирование** — изоляция бизнес-логики.  
+2. **Интеграционное (Integration) тестирование** — проверка взаимодействия компонентов в среде Spring Boot.
+
+Тестовое покрытие охватывает критически важные функциональные блоки: управление пользователями, обработку заказов, систему отзывов и аналитику продаж.
+
+---
+
+### Модульное тестирование
+
+Первый уровень тестирования сфокусирован на слое доменной модели. Поскольку архитектура приложения построена на принципах **Domain-Driven Design (DDD)** с использованием шаблона **Rich Domain Model**, значительная часть бизнес-правил и валидации данных инкапсулирована непосредственно в сущностях (`User`, `Review`, `Order`).
+
+Unit-тесты реализованы на **JUnit 5** и полностью изолированы: выполняются без Spring-контекста и без подключения к базе данных. Это обеспечивает высокую скорость выполнения тестов.
+
+Проверяются **инварианты сущностей** — условия, которые всегда должны быть истинными. Например, в `UserTest` проверяется фабричный метод регистрации пользователя: невозможно создать пользователя с некорректным email или недопустимым телефонным номером.  
+
+Также покрыта логика управления состоянием, например, корректность сброса флага «по умолчанию» у адресов.
+
+В `ReviewTest` проверяются граничные условия — попытка создания отзыва с рейтингом вне диапазона 1–5 или с пустым текстом приводит к `DomainException`.
+
+#### Пример модульного теста `UserTest`
+
+```java
+class UserTest {
+
+    @Test
+    @DisplayName("Should register user with valid data")
+    void shouldRegisterUser() {
+        User user = User.register(
+                "testuser",
+                "test@example.com",
+                "encrypted_pass",
+                Role.CLIENT,
+                "John",
+                "Doe",
+                "+375291112233"
+        );
+
+        assertNull(user.getId());
+        assertEquals("testuser", user.getUsername());
+        assertEquals("John", user.getFirstName());
+        assertNotNull(user.getCreatedAt());
+    }
+
+    @Test
+    @DisplayName("Should throw exception for invalid email")
+    void shouldFailOnInvalidEmail() {
+        assertThrows(DomainException.class, () -> User.register(
+                "testuser",
+                "invalid-email",
+                "pass",
+                Role.CLIENT,
+                null, null, null
+        ));
+    }
+
+    @Test
+    @DisplayName("Should throw exception for short password")
+    void shouldFailOnShortPassword() {
+        assertThrows(DomainException.class, () -> User.validateRawPassword("123"));
+    }
+
+    @Test
+    @DisplayName("Should add address and manage default flag")
+    void shouldAddAddress() {
+        User user = User.register("user1", "e@e.com", "p", Role.CLIENT, null, null, null);
+
+        UserAddress addr1 = UserAddress.builder()
+                .addressName("Home").addressText("Street 1").isDefault(true).build();
+
+        UserAddress addr2 = UserAddress.builder()
+                .addressName("Work").addressText("Street 2").isDefault(true).build();
+
+        user.addAddress(addr1);
+        assertTrue(addr1.getIsDefault());
+
+        user.addAddress(addr2);
+
+        assertFalse(addr1.getIsDefault());
+        assertTrue(addr2.getIsDefault());
+        assertEquals(2, user.getAddresses().size());
+    }
+}
+````
+
+---
+
+### Интеграционное тестирование
+
+Второй уровень тестирования направлен на проверку корректности работы REST API и взаимодействия компонентов приложения: **Controller → Service → Repository → Database**.
+
+Тесты выполняются с использованием аннотаций:
+
+* `@SpringBootTest`
+* `@AutoConfigureMockMvc`
+
+Для эмуляции HTTP-запросов применяется **MockMvc**, позволяющий выполнять `POST`, `GET`, `DELETE` запросы с передачей JSON и авторизационных заголовков.
+
+#### Тестовый профиль
+
+Используется конфигурация:
+
+```
+@ActiveProfiles("test")
+```
+
+В этом профиле:
+
+* реальная MySQL заменена на **H2 in-memory** в режиме совместимости с MySQL;
+* база создаётся «с нуля» перед каждым запуском тестов;
+* перед каждым тестом репозитории очищаются в `@BeforeEach`, что обеспечивает идемпотентность.
+
+#### Заглушки внешних сервисов
+
+Для отключения инфраструктурных зависимостей используются:
+
+```
+@MockitoBean
+```
+
+Это позволяет тестировать без реального Elasticsearch и без вызовов OpenAI API.
+
+Таким образом, тесты `OrderControllerTest`, `ReviewControllerTest`, `AuthenticationControllerTest` выполняются автономно.
+
+#### Проверяемые сценарии
+
+Интеграционные тесты покрывают ключевые бизнес-процессы:
+
+* создание заказов (полный workflow: авторизация → JWT → отправка DTO → запись в БД);
+* безопасность (403 для неавторизованных, отсутствие доступа к аналитике у клиентов);
+* обработка ошибок (например, дублирующий отзыв);
+* транзакционность и корректность работы JPA/Hibernate (устранены ошибки `ObjectOptimisticLockingFailureException`).
+
+---
+
+#### Пример интеграционного теста `ReviewControllerTest`
+
+```java
+@SpringBootTest
+@AutoConfigureMockMvc
+@ActiveProfiles("test")
+class ReviewControllerTest {
+
+    @Autowired private MockMvc mockMvc;
+    @Autowired private ReviewRepository reviewRepository;
+    @Autowired private UserRepository userRepository;
+    @Autowired private BookRepository bookRepository;
+    @Autowired private PasswordEncoder passwordEncoder;
+    @Autowired private JwtService jwtService;
+    @Autowired private ObjectMapper objectMapper;
+
+    @MockitoBean
+    private com.bsuir.book_store.catalog.infrastructure.elastic.BookElasticRepository elasticRepository;
+
+    private String clientToken;
+    private String managerToken;
+    private UUID bookId;
+
+    @BeforeEach
+    void setUp() {
+        reviewRepository.deleteAll();
+        userRepository.deleteAll();
+        bookRepository.deleteAll();
+
+        User client = User.register("client", "c@test.com", passwordEncoder.encode("123"), Role.CLIENT, null, null, null);
+        userRepository.save(client);
+        clientToken = jwtService.generateToken(client);
+
+        User manager = User.register("manager", "m@test.com", passwordEncoder.encode("123"), Role.MANAGER, null, null, null);
+        userRepository.save(manager);
+        managerToken = jwtService.generateToken(manager);
+
+        Book book = Book.builder().title("Test Book").isbn("111").cost(BigDecimal.TEN).stockQuantity(10).build();
+        bookId = bookRepository.save(book).getId();
+    }
+
+    @Test
+    void shouldAddReviewSuccessfully() throws Exception {
+        CreateReviewRequest request = new CreateReviewRequest();
+        request.setBookId(bookId);
+        request.setRating(5);
+        request.setText("Excellent!");
+
+        mockMvc.perform(post("/api/reviews")
+                        .header("Authorization", "Bearer " + clientToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void shouldForbidDuplicateReview() throws Exception {
+        CreateReviewRequest request = new CreateReviewRequest();
+        request.setBookId(bookId);
+        request.setRating(5);
+        request.setText("First");
+
+        mockMvc.perform(post("/api/reviews")
+                        .header("Authorization", "Bearer " + clientToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk());
+
+        mockMvc.perform(post("/api/reviews")
+                        .header("Authorization", "Bearer " + clientToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void managerShouldDeleteReview() throws Exception {
+        User client = userRepository.findByUsername("client").get();
+        Book book = bookRepository.findById(bookId).get();
+        var review = com.bsuir.book_store.reviews.domain.Review.leave(client, book, 5, "Text");
+        UUID reviewId = reviewRepository.save(review).getId();
+
+        mockMvc.perform(delete("/api/reviews/" + reviewId)
+                        .header("Authorization", "Bearer " + managerToken))
+                .andExpect(status().isNoContent());
+    }
+
+    @Test
+    void clientCannotDeleteReview() throws Exception {
+        UUID randomId = UUID.randomUUID();
+        mockMvc.perform(delete("/api/reviews/" + randomId)
+                        .header("Authorization", "Bearer " + clientToken))
+                .andExpect(status().isForbidden());
+    }
+}
+```
 
 ---
 
